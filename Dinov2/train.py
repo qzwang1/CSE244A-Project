@@ -1,7 +1,7 @@
 # ==========================================================
 # DINOv2 training script for CSIRO - Image2Biomass Prediction
 # - Image only, no metadata
-# - Default uses 5-fold CV (set CFG.n_folds=1 if you don't want K-Fold)
+# - Default uses 5-fold CV (set CFG.n_folds=1 to disable K-Fold)
 # - Backbone: DINOv2 from timm, frozen; train only a small regression head
 # ==========================================================
 
@@ -22,27 +22,28 @@ from timm.data import resolve_model_data_config, create_transform
 
 # ---------------- Config ----------------
 class CFG:
-    train_csv = "/root/dataset/train.csv"   # 改成你的路径
-    img_root  = "/root/dataset"            # 图像根目录 (包含 train/ 目录)
+    train_csv = "/root/dataset/train.csv"     # path to train.csv
+    img_root  = "/root/dataset"              # root directory of images
 
     model_name = "vit_large_patch14_dinov2.lvd142m"  # DINOv2 backbone
-    freeze_backbone = True                 # 只训练 head
-    hidden_dim = 512                       # 回归 head 的中间维度
+    freeze_backbone = True                   # freeze all backbone weights
+    hidden_dim = 512                         # dimension for regression head
 
-    batch_size = 8                         # DINOv2 比较大，batch 可以先设置小一点
+    batch_size = 8                           # small batch because DINOv2 is large
     epochs = 60
     lr = 3e-4
     weight_decay = 1e-4
     num_workers = 4
     seed = 42
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_folds = 5                            # 想关掉 K-Fold 就设成 1
+    n_folds = 5                              # set to 1 if no K-fold training
 
     out_dir = "./weights_dinov2"
-    patience = 12       # early stopping
-    min_delta = 1e-4    # R2 最小提升幅度
+    patience = 12                            # early stopping patience
+    min_delta = 1e-4                         # minimal R2 improvement for saving
 
 
+# ---------------- Set random seed for reproducibility ----------------
 def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
@@ -56,8 +57,10 @@ set_seed(CFG.seed)
 os.makedirs(CFG.out_dir, exist_ok=True)
 
 
-# ---------------- 目标定义（比赛用到的五个） ----------------
+# ---------------- Target definitions (5 outputs) ----------------
 TARGET_ORDER = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
+
+# Weights for competition metric
 WEIGHTS = {
     "Dry_Green_g": 0.1,
     "Dry_Dead_g": 0.1,
@@ -67,7 +70,7 @@ WEIGHTS = {
 }
 
 
-# ---------------- 加载 train.csv，pivot 成 per-image ----------------
+# ---------------- Load train.csv and pivot into per-image format ----------------
 df_raw = pd.read_csv(CFG.train_csv)
 
 pivot = df_raw.pivot_table(
@@ -83,6 +86,7 @@ print("Total unique images:", len(pivot))
 
 # ---------------- Dataset ----------------
 class ImageOnlyDataset(Dataset):
+    """Dataset that returns only image tensor and 5 regression targets."""
     def __init__(self, df, img_root, transform):
         self.df = df.reset_index(drop=True)
         self.img_root = img_root
@@ -95,6 +99,7 @@ class ImageOnlyDataset(Dataset):
         row = self.df.iloc[idx]
         img_rel = row["image_path"]
         img_path = os.path.join(self.img_root, img_rel)
+
         img = Image.open(img_path).convert("RGB")
         img = self.transform(img)
 
@@ -102,8 +107,9 @@ class ImageOnlyDataset(Dataset):
         return img, torch.tensor(y)
 
 
-# ---------------- Metric: weighted R² ----------------
+# ---------------- Weighted R² metric ----------------
 def weighted_r2(y_true: torch.Tensor, y_pred: torch.Tensor):
+    """Compute weighted R² score used by the competition."""
     ys = y_true.detach().cpu().numpy()
     ps = y_pred.detach().cpu().numpy()
 
@@ -128,21 +134,26 @@ def weighted_r2(y_true: torch.Tensor, y_pred: torch.Tensor):
     return 1.0 - ss_res / ss_tot
 
 
-# ---------------- 模型：DINOv2 backbone + 小 head ----------------
+# ---------------- Model: DINOv2 backbone + small regression head ----------------
 class DinoRegressor(nn.Module):
+    """Frozen backbone + trainable MLP regression head."""
     def __init__(self, backbone_name, num_targets=5, hidden_dim=512, freeze_backbone=True):
         super().__init__()
+
+        # Load DINOv2 pretrained backbone
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=True,
-            num_classes=0,    # 去掉分类 head，输出特征向量
+            num_classes=0,    # remove classification head
         )
         feat_dim = self.backbone.num_features
 
+        # Freeze backbone weights (feature extractor only)
         if freeze_backbone:
             for p in self.backbone.parameters():
                 p.requires_grad = False
 
+        # Small regression head
         self.head = nn.Sequential(
             nn.Linear(feat_dim, hidden_dim),
             nn.ReLU(),
@@ -151,13 +162,13 @@ class DinoRegressor(nn.Module):
         )
 
     def forward(self, x):
-        feat = self.backbone(x)  # [B, feat_dim]
+        feat = self.backbone(x)  # [B, feature_dim]
         out = self.head(feat)    # [B, 5]
         return out
 
 
-# ---------------- 准备 DINOv2 对应的 transforms ----------------
-# 用 timm 官方推荐的 data_config / transforms
+# ---------------- DINOv2 recommended preprocessing ----------------
+# Use timm official data_config and transforms
 tmp_model = timm.create_model(CFG.model_name, pretrained=True, num_classes=0)
 data_config = resolve_model_data_config(tmp_model)
 train_transform = create_transform(**data_config, is_training=True)
@@ -165,7 +176,7 @@ valid_transform = create_transform(**data_config, is_training=False)
 del tmp_model
 
 
-# ---------------- Train / Valid ----------------
+# ---------------- Training & Validation loops ----------------
 def train_one_epoch(model, loader, optimizer, criterion):
     model.train()
     total_loss = 0.0
@@ -226,11 +237,10 @@ def valid_one_epoch(model, loader, criterion):
     return avg_loss, r2
 
 
-# ---------------- K-Fold Training ----------------
+# ---------------- K-Fold training ----------------
 if CFG.n_folds <= 1:
-    # 相当于不做 K-Fold，只是简单 train/valid split
+    # If no K-Fold, just use first split from KFold
     kf = KFold(n_splits=5, shuffle=True, random_state=CFG.seed)
-    # 取第一折作为一个 split
     splits = [next(kf.split(pivot))]
 else:
     kf = KFold(n_splits=CFG.n_folds, shuffle=True, random_state=CFG.seed)
@@ -292,7 +302,7 @@ for fold, (train_idx, valid_idx) in enumerate(splits):
             f"valid loss: {valid_loss:.4f}  valid R2: {valid_r2:.4f}"
         )
 
-        # early stopping 按 valid_R2
+        # Save best checkpoint based on validation R²
         if valid_r2 > best_r2 + CFG.min_delta:
             best_r2 = valid_r2
             best_epoch = epoch
