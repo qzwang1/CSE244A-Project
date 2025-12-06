@@ -1,0 +1,400 @@
+# ==========================================================
+# script_2_stage2_img_plus_pred_meta.py
+#
+# Stage2: 图片 + Stage1 预测的 meta (OOF) → 预测 5 个 biomass 目标
+# - 使用 train.csv（长表）构建 per-image target
+# - 使用 train_meta_oof.csv（Stage1 生成）作为 meta 特征
+# - K-Fold 训练，按 weighted R^2 做 early stopping
+# ==========================================================
+
+import os
+import random
+import numpy as np
+import pandas as pd
+from PIL import Image
+
+from sklearn.model_selection import KFold
+
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+import timm
+
+
+# ---------------- Config ----------------
+class CFG_STAGE2:
+    train_csv = "/root/dataset/train.csv"          # 原始长表
+    oof_meta_csv = "/root/dataset/train_meta_oof.csv"  # Stage1 生成的 OOF meta
+    img_root  = "/root/dataset"
+
+    model_name = "tf_efficientnetv2_s"
+    img_height = 512
+    img_width  = 1024
+
+    batch_size = 8
+    epochs = 80
+    lr = 3e-4
+    weight_decay = 1e-4
+    num_workers = 4
+    seed = 42
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    n_folds = 5
+
+    out_dir = "./weights_stage2_main"
+
+    patience = 15       # early stopping
+    min_delta = 1e-4    # early stopping 最小改进幅度
+
+
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+set_seed(CFG_STAGE2.seed)
+os.makedirs(CFG_STAGE2.out_dir, exist_ok=True)
+
+
+# ---------------- 目标定义（比赛权重） ----------------
+TARGET_ORDER = ["Dry_Green_g", "Dry_Dead_g", "Dry_Clover_g", "GDM_g", "Dry_Total_g"]
+WEIGHTS = {
+    "Dry_Green_g": 0.1,
+    "Dry_Dead_g": 0.1,
+    "Dry_Clover_g": 0.1,
+    "GDM_g": 0.2,
+    "Dry_Total_g": 0.5,
+}
+TARGET2IDX = {t: i for i, t in enumerate(TARGET_ORDER)}
+
+
+# ---------------- 加载 train.csv，pivot 出 per-image target ----------------
+df_raw = pd.read_csv(CFG_STAGE2.train_csv)
+
+pivot = df_raw.pivot_table(
+    index="image_path",
+    columns="target_name",
+    values="target"
+).reset_index()
+
+# 只保留我们需要的顺序
+pivot = pivot[["image_path"] + TARGET_ORDER]
+
+print("Stage2 - total unique images in train.csv:", len(pivot))
+
+
+# ---------------- 加载 Stage1 生成的 OOF meta ----------------
+df_oof = pd.read_csv(CFG_STAGE2.oof_meta_csv)
+print("Stage2 - total rows in OOF meta:", len(df_oof))
+
+# 只留一次（理论上每个 image_path 一行）
+df_oof = df_oof.drop_duplicates("image_path").reset_index(drop=True)
+
+# 合并 target 和 OOF meta
+df_all = pivot.merge(df_oof, on="image_path", how="inner").reset_index(drop=True)
+
+print("Stage2 - merged images:", len(df_all))
+
+# 找出所有 meta 特征列（除 image_path 和 target）
+meta_cols = [c for c in df_all.columns if c not in ["image_path"] + TARGET_ORDER]
+META_FEATURES = meta_cols
+print("Stage2 - meta feature dim:", len(META_FEATURES))
+
+
+# ---------------- Dataset ----------------
+class ImgPredMetaDataset(Dataset):
+    def __init__(self, df, img_root, transform=None):
+        self.df = df.reset_index(drop=True)
+        self.img_root = img_root
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.df)
+
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+        img_path = os.path.join(self.img_root, row["image_path"])
+        img = Image.open(img_path).convert("RGB")
+
+        if self.transform is not None:
+            img = self.transform(img)
+
+        # Stage1 预测的 meta 特征
+        meta_vec = row[META_FEATURES].values.astype("float32")
+        # 5 个目标
+        y = row[TARGET_ORDER].values.astype("float32")
+
+        return img, torch.tensor(meta_vec), torch.tensor(y)
+
+
+# ---------------- Transforms ----------------
+train_transform = T.Compose([
+    T.Resize((CFG_STAGE2.img_height, CFG_STAGE2.img_width)),
+    T.RandomHorizontalFlip(p=0.5),
+    T.RandomRotation(degrees=10),
+    T.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02),
+    T.RandomResizedCrop((CFG_STAGE2.img_height, CFG_STAGE2.img_width),
+                        scale=(0.7, 1.0), ratio=(1.8, 2.2)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),
+])
+
+valid_transform = T.Compose([
+    T.Resize((CFG_STAGE2.img_height, CFG_STAGE2.img_width)),
+    T.ToTensor(),
+    T.Normalize(mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]),
+])
+
+
+# ---------------- Metric: weighted R² ----------------
+def weighted_r2(y_true: torch.Tensor, y_pred: torch.Tensor):
+    ys = y_true.detach().cpu().numpy()
+    ps = y_pred.detach().cpu().numpy()
+
+    all_y = []
+    all_p = []
+    all_w = []
+
+    for i, t in enumerate(TARGET_ORDER):
+        w = WEIGHTS[t]
+        all_y.append(ys[:, i])
+        all_p.append(ps[:, i])
+        all_w.append(np.full(len(ys), w))
+
+    y_all = np.concatenate(all_y)
+    p_all = np.concatenate(all_p)
+    w_all = np.concatenate(all_w)
+
+    y_wbar = np.sum(w_all * y_all) / np.sum(w_all)
+    ss_res = np.sum(w_all * (y_all - p_all) ** 2)
+    ss_tot = np.sum(w_all * (y_all - y_wbar) ** 2) + 1e-8
+
+    return 1.0 - ss_res / ss_tot
+
+
+# ---------------- 主模型：图片 + 预测 meta ----------------
+class CSIROStage2Model(nn.Module):
+    def __init__(
+        self,
+        model_name,
+        metadata_dim,
+        num_classes=5,
+        in_chans=3,
+        fusion_dim=256,
+        dropout=0.3,
+        meta_dropout=0.2,
+    ):
+        super().__init__()
+
+        self.metadata_dim = metadata_dim
+
+        # 图像 backbone
+        self.image_model = timm.create_model(
+            model_name=model_name,
+            pretrained=True,
+            in_chans=in_chans,
+            num_classes=0,
+            drop_rate=0.2,
+            drop_path_rate=0.1,
+        )
+        self.image_feature_dim = self.image_model.num_features
+
+        # meta 处理 MLP
+        self.meta_net = nn.Sequential(
+            nn.Linear(metadata_dim, 128),
+            nn.ReLU(),
+            nn.Dropout(meta_dropout),
+            nn.Linear(128, 64),
+            nn.ReLU(),
+            nn.Dropout(meta_dropout),
+        )
+        self.meta_out_dim = 64
+
+        combined_dim = self.image_feature_dim + self.meta_out_dim
+
+        self.fusion = nn.Sequential(
+            nn.Linear(combined_dim, fusion_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(fusion_dim, fusion_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+
+        self.head = nn.Linear(fusion_dim // 2, num_classes)
+
+    def forward(self, image, meta):
+        img_feat = self.image_model(image)
+        meta_feat = self.meta_net(meta)
+        feat = torch.cat([img_feat, meta_feat], dim=1)
+        fusion = self.fusion(feat)
+        out = self.head(fusion)
+        return out
+
+
+# ---------------- Train / Valid ----------------
+def train_one_epoch(model, loader, optimizer, criterion):
+    model.train()
+    total_loss = 0.0
+    n = 0
+    all_true = []
+    all_pred = []
+
+    for imgs, meta, targets in loader:
+        imgs = imgs.to(CFG_STAGE2.device)
+        meta = meta.to(CFG_STAGE2.device)
+        targets = targets.to(CFG_STAGE2.device)
+
+        optimizer.zero_grad()
+        preds = model(imgs, meta)
+        loss = criterion(preds, targets)
+        loss.backward()
+        optimizer.step()
+
+        bs = imgs.size(0)
+        total_loss += loss.item() * bs
+        n += bs
+
+        all_true.append(targets.detach().cpu())
+        all_pred.append(preds.detach().cpu())
+
+    avg_loss = total_loss / n
+    all_true = torch.cat(all_true, dim=0)
+    all_pred = torch.cat(all_pred, dim=0)
+    r2 = weighted_r2(all_true, all_pred)
+    return avg_loss, r2
+
+
+def valid_one_epoch(model, loader, criterion):
+    model.eval()
+    total_loss = 0.0
+    n = 0
+    all_true = []
+    all_pred = []
+
+    with torch.no_grad():
+        for imgs, meta, targets in loader:
+            imgs = imgs.to(CFG_STAGE2.device)
+            meta = meta.to(CFG_STAGE2.device)
+            targets = targets.to(CFG_STAGE2.device)
+
+            preds = model(imgs, meta)
+            loss = criterion(preds, targets)
+
+            bs = imgs.size(0)
+            total_loss += loss.item() * bs
+            n += bs
+
+            all_true.append(targets.detach().cpu())
+            all_pred.append(preds.detach().cpu())
+
+    avg_loss = total_loss / n
+    all_true = torch.cat(all_true, dim=0)
+    all_pred = torch.cat(all_pred, dim=0)
+    r2 = weighted_r2(all_true, all_pred)
+    return avg_loss, r2
+
+
+# ---------------- K-Fold Training ----------------
+kf = KFold(n_splits=CFG_STAGE2.n_folds, shuffle=True, random_state=CFG_STAGE2.seed)
+fold_best_r2 = []
+
+for fold, (train_idx, valid_idx) in enumerate(kf.split(df_all)):
+    print(f"\n========== Stage2 Fold {fold+1}/{CFG_STAGE2.n_folds} ==========")
+
+    train_df = df_all.iloc[train_idx].reset_index(drop=True)
+    valid_df = df_all.iloc[valid_idx].reset_index(drop=True)
+
+    train_ds = ImgPredMetaDataset(train_df, CFG_STAGE2.img_root, transform=train_transform)
+    valid_ds = ImgPredMetaDataset(valid_df, CFG_STAGE2.img_root, transform=valid_transform)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=CFG_STAGE2.batch_size,
+        shuffle=True,
+        num_workers=CFG_STAGE2.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+    valid_loader = DataLoader(
+        valid_ds,
+        batch_size=CFG_STAGE2.batch_size,
+        shuffle=False,
+        num_workers=CFG_STAGE2.num_workers,
+        pin_memory=True,
+        drop_last=False,
+    )
+
+    meta_dim = len(META_FEATURES)
+    print(f"Stage2 Fold {fold+1}: train={len(train_ds)}, valid={len(valid_ds)}, meta_dim={meta_dim}")
+
+    model = CSIROStage2Model(
+        model_name=CFG_STAGE2.model_name,
+        metadata_dim=meta_dim,
+        num_classes=len(TARGET_ORDER),
+        in_chans=3,
+        fusion_dim=256,
+        dropout=0.3,
+        meta_dropout=0.2,
+    ).to(CFG_STAGE2.device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=CFG_STAGE2.lr,
+        weight_decay=CFG_STAGE2.weight_decay,
+    )
+    criterion = nn.MSELoss()
+
+    best_r2 = -1e9
+    best_epoch = -1
+    bad_epochs = 0
+
+    for epoch in range(1, CFG_STAGE2.epochs + 1):
+        train_loss, train_r2 = train_one_epoch(model, train_loader, optimizer, criterion)
+        valid_loss, valid_r2 = valid_one_epoch(model, valid_loader, criterion)
+
+        print(
+            f"Fold {fold+1} | Epoch {epoch:03d}/{CFG_STAGE2.epochs} "
+            f"| train loss: {train_loss:.4f}  train R2: {train_r2:.4f}  "
+            f"valid loss: {valid_loss:.4f}  valid R2: {valid_r2:.4f}"
+        )
+
+        # early stopping 按 valid_r2（越大越好）
+        if valid_r2 > best_r2 + CFG_STAGE2.min_delta:
+            best_r2 = valid_r2
+            best_epoch = epoch
+            bad_epochs = 0
+
+            save_path = os.path.join(CFG_STAGE2.out_dir, f"stage2_main_fold{fold+1}.pth")
+            torch.save(
+                {
+                    "model": model.state_dict(),
+                    "META_FEATURES": META_FEATURES,
+                },
+                save_path
+            )
+            print(
+                f"  → Saved best Stage2 model for fold {fold+1} at epoch {best_epoch}, "
+                f"valid_R2={best_r2:.4f}"
+            )
+        else:
+            bad_epochs += 1
+            if bad_epochs >= CFG_STAGE2.patience:
+                print(f"  → Early stopping Stage2 fold {fold+1} at epoch {epoch}")
+                break
+
+    fold_best_r2.append(best_r2)
+    print(
+        f"Stage2 Fold {fold+1} finished. "
+        f"Best valid R2 = {best_r2:.4f} at epoch {best_epoch}"
+    )
+
+print("\nStage2 All folds finished.")
+print("Stage2 Fold R2:", fold_best_r2)
+print("Stage2 Mean R2:", np.mean(fold_best_r2))
