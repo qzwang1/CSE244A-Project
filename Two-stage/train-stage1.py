@@ -1,11 +1,11 @@
 # ==========================================================
 # script_1_stage1_kfold_oof_meta.py
 #
-# Stage1: 从图像预测 4 个 metadata（NDVI, Height, State, Species）
-# - 使用 K-Fold 训练，生成 OOF 预测 (train_meta_oof.csv)
-# - 每个 fold 保存一个模型 (stage1_meta_fold{fold}.pth)
+# Stage 1: predict 4 metadata values from images (NDVI, Height, State, Species)
+# - Train with K-Fold and generate OOF predictions (train_meta_oof.csv)
+# - Save one model per fold (stage1_meta_fold{fold}.pth)
 #
-# 之后 Stage2 读取 train_meta_oof.csv 作为预测 meta 特征。
+# Stage 2 will load train_meta_oof.csv as predicted metadata features.
 # ==========================================================
 
 import os
@@ -25,8 +25,8 @@ import timm
 
 # ---------------- Config ----------------
 class CFG_STAGE1:
-    train_csv = "/root/dataset/train.csv"   # 原始长表
-    img_root  = "/root/dataset"            # 图像根目录
+    train_csv = "/root/dataset/train.csv"   # long-format original train file
+    img_root  = "/root/dataset"            # image root directory
 
     model_name = "tf_efficientnetv2_s"
     img_height = 512
@@ -44,7 +44,7 @@ class CFG_STAGE1:
     out_dir = "./weights_stage1_meta_kfold"
     oof_csv = "/root/dataset/train_meta_oof.csv"
 
-    # 损失权重（可以后面微调）
+    # loss weights
     w_ndvi = 1.0
     w_height = 1.0
     w_state = 1.0
@@ -67,10 +67,9 @@ set_seed(CFG_STAGE1.seed)
 os.makedirs(CFG_STAGE1.out_dir, exist_ok=True)
 
 
-# ---------------- 读原始 train.csv，构建 per-image + meta ----------------
+# ---------------- Build per-image metadata table ----------------
 df_raw = pd.read_csv(CFG_STAGE1.train_csv)
 
-# 每张图像一行，带上 4 个 meta
 meta_cols = [
     "image_path",
     "Pre_GSHH_NDVI",
@@ -80,7 +79,7 @@ meta_cols = [
 ]
 df_meta = df_raw[meta_cols].drop_duplicates("image_path").reset_index(drop=True)
 
-# 编码 State / Species 为整数 id
+# Encode State / Species as integer IDs
 state_codes = {name: i for i, name in enumerate(sorted(df_meta["State"].unique()))}
 species_codes = {name: i for i, name in enumerate(sorted(df_meta["Species"].unique()))}
 
@@ -124,7 +123,7 @@ class MetaNetDataset(Dataset):
             torch.tensor(height),
             torch.tensor(state_id),
             torch.tensor(species_id),
-            row["image_path"],  # 为了 OOF 记录
+            row["image_path"],  # used to record OOF predictions
         )
 
 
@@ -147,7 +146,7 @@ valid_transform = T.Compose([
 ])
 
 
-# ---------------- Model: MetaNet (image -> 4 meta) ----------------
+# ---------------- Model: MetaNet (image -> 4 metadata targets) ----------------
 class MetaNet(nn.Module):
     def __init__(self, backbone_name, num_state, num_species):
         super().__init__()
@@ -216,7 +215,6 @@ def valid_one_epoch(model, loader, criterion_reg, criterion_cls):
     total_loss = 0.0
     n = 0
 
-    # 记录一些简单指标（可选）
     ndvi_abs_err = []
     h_abs_err = []
     state_correct = 0
@@ -267,12 +265,10 @@ def valid_one_epoch(model, loader, criterion_reg, criterion_cls):
     return avg_loss, ndvi_mae, h_mae, state_acc, species_acc
 
 
-# ---------------- K-Fold Training + OOF 预测 ----------------
+# ---------------- K-Fold Training + OOF predictions ----------------
 kf = KFold(n_splits=CFG_STAGE1.n_folds, shuffle=True, random_state=CFG_STAGE1.seed)
 
-# 用来存 OOF 预测
 oof_records = []
-
 fold_best_losses = []
 
 for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
@@ -319,14 +315,15 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
     best_epoch = -1
     bad_epochs = 0
 
-    for epoch in range(1, CFG_STAGE1.epochs + 1):
+    for epoch in enumerate(range(1, CFG_STAGE1.epochs + 1), start=1):
+        epoch_idx = epoch[1]
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion_reg, criterion_cls)
         val_loss, ndvi_mae, h_mae, state_acc, species_acc = valid_one_epoch(
             model, valid_loader, criterion_reg, criterion_cls
         )
 
         print(
-            f"Fold {fold+1} | Epoch {epoch:03d}/{CFG_STAGE1.epochs} "
+            f"Fold {fold+1} | Epoch {epoch_idx:03d}/{CFG_STAGE1.epochs} "
             f"| train loss: {train_loss:.4f}  val loss: {val_loss:.4f}  "
             f"NDVI_MAE: {ndvi_mae:.4f}  H_MAE: {h_mae:.4f}  "
             f"State_acc: {state_acc:.4f}  Species_acc: {species_acc:.4f}"
@@ -334,7 +331,7 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
 
         if val_loss < best_val_loss - CFG_STAGE1.min_delta:
             best_val_loss = val_loss
-            best_epoch = epoch
+            best_epoch = epoch_idx
             bad_epochs = 0
 
             save_path = os.path.join(CFG_STAGE1.out_dir, f"stage1_meta_fold{fold+1}.pth")
@@ -350,13 +347,13 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
         else:
             bad_epochs += 1
             if bad_epochs >= CFG_STAGE1.patience:
-                print(f"  → Early stopping Stage1 fold {fold+1} at epoch {epoch}")
+                print(f"  → Early stopping Stage1 fold {fold+1} at epoch {epoch_idx}")
                 break
 
     fold_best_losses.append(best_val_loss)
     print(f"Stage1 Fold {fold+1} finished. Best val loss = {best_val_loss:.4f} at epoch {best_epoch}")
 
-    # 载入这一折的最佳模型，用来对该折的验证集做 OOF 预测
+    # load best model for this fold and generate OOF predictions on the fold's validation set
     ckpt_path = os.path.join(CFG_STAGE1.out_dir, f"stage1_meta_fold{fold+1}.pth")
     ckpt = torch.load(ckpt_path, map_location=CFG_STAGE1.device)
     model.load_state_dict(ckpt["model"])
@@ -364,7 +361,6 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
 
     softmax = nn.Softmax(dim=1)
 
-    # 对 valid_df 做预测
     valid_loader_for_oof = DataLoader(
         valid_ds,
         batch_size=CFG_STAGE1.batch_size,
@@ -391,10 +387,8 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_meta)):
                     "pred_ndvi": float(pred_ndvi[i]),
                     "pred_height": float(pred_h[i]),
                 }
-                # state 概率
                 for j in range(num_state):
                     rec[f"pstate_{j}"] = float(state_prob[i, j])
-                # species 概率
                 for j in range(num_species):
                     rec[f"psp_{j}"] = float(species_prob[i, j])
 
@@ -404,10 +398,9 @@ print("\nStage1 All folds finished.")
 print("Stage1 Fold best val losses:", fold_best_losses)
 print("Stage1 Mean val loss:", np.mean(fold_best_losses))
 
-# ---------------- 保存 OOF 预测到 CSV ----------------
+# ---------------- Save OOF predictions ----------------
 df_oof = pd.DataFrame(oof_records)
 
-# 确保每个 image_path 只出现一次（理论上 OOF 正好覆盖所有样本各一次）
 df_oof = df_oof.drop_duplicates("image_path").reset_index(drop=True)
 
 df_oof.to_csv(CFG_STAGE1.oof_csv, index=False)
