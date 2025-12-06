@@ -18,11 +18,11 @@ import timm
 # Config
 # ==========================================================
 class CFG:
-    train_csv = "/root/dataset/train.csv"   # 改成你自己的路径
-    img_root  = "/root/dataset"            # 根目录，下边有 images
+    train_csv = "/root/dataset/train.csv"
+    img_root = "/root/dataset"
     model_name = "tf_efficientnetv2_s"
-    img_height = 384                       # 稍微放大一点提升分
-    img_width  = 768
+    img_height = 384
+    img_width = 768
     batch_size = 16
     epochs = 50
     lr = 3e-4
@@ -32,10 +32,10 @@ class CFG:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     n_folds = 5
 
-    # 三种改进的核心参数
-    warmup_epochs = 8          # 前 8 个 epoch 完全不用 meta
-    image_only_prob = 0.5      # 之后训练阶段：50% 只用 image
-    meta_dropout_p = 0.5       # 在模型里对 meta 做 50% dropout
+    # Core improvements for robustness
+    warmup_epochs = 8          # no metadata during warmup
+    image_only_prob = 0.5      # probability of image-only batches after warmup
+    meta_dropout_p = 0.5       # drop metadata inside the model
 
     out_dir = "./weights_meta_robust"
 
@@ -69,7 +69,7 @@ os.makedirs(CFG.out_dir, exist_ok=True)
 
 def weighted_r2(y_true, y_pred):
     """
-    y_true, y_pred: torch.Tensor on CPU, shape [N, 5]
+    Weighted R2 computation (competition metric).
     """
     ys = y_true.numpy()
     ps = y_pred.numpy()
@@ -96,11 +96,11 @@ def weighted_r2(y_true, y_pred):
 
 
 # ==========================================================
-# Build aggregated dataframe: one row per image + meta
+# Data preparation (image + metadata)
 # ==========================================================
 df_raw = pd.read_csv(CFG.train_csv)
 
-# meta 部分（按 image_path 去重）
+# Unique metadata per image
 meta_cols = [
     "image_path",
     "Sampling_Date",
@@ -111,32 +111,30 @@ meta_cols = [
 ]
 df_meta = df_raw[meta_cols].drop_duplicates("image_path").reset_index(drop=True)
 
-# 目标 pivot 到一行 5 列
+# Targets into a single row per image
 pivot = df_raw.pivot_table(
     index="image_path",
     columns="target_name",
     values="target"
 ).reset_index()
-
 pivot = pivot[["image_path"] + TARGET_ORDER]
 
-# 合并
+# Merge metadata + targets
 df_all = df_meta.merge(pivot, on="image_path", how="inner").reset_index(drop=True)
 
-# 处理日期为数值
+# Convert date to numeric
 df_all["Sampling_Date"] = pd.to_datetime(df_all["Sampling_Date"])
 df_all["date_ordinal"] = df_all["Sampling_Date"].map(pd.Timestamp.toordinal)
 
-# 数值 meta 列
+# Numeric metadata
 num_cols = ["date_ordinal", "Pre_GSHH_NDVI", "Height_Ave_cm"]
 
-# 类别 one-hot
+# One-hot encode categorical metadata
 cat_dummies = pd.get_dummies(
     df_all[["State", "Species"]],
     prefix=["state", "sp"]
 )
 
-# 先不归一化，后面在 fold 内做 scaler
 meta_features = pd.concat([df_all[num_cols], cat_dummies], axis=1)
 META_FEATURES = list(meta_features.columns)
 
@@ -164,9 +162,7 @@ class BiomassMetaDataset(Dataset):
         if self.transform is not None:
             img = self.transform(img)
 
-        # meta 向量
         meta_vec = row[META_FEATURES].values.astype("float32")
-        # targets: 按固定顺序
         y = row[TARGET_ORDER].values.astype("float32")
 
         return img, torch.tensor(meta_vec), torch.tensor(y)
@@ -194,7 +190,7 @@ valid_transform = T.Compose([
 
 
 # ==========================================================
-# Model with meta + fusion + meta dropout
+# Model with image + metadata fusion + metadata dropout
 # ==========================================================
 class CSIROModel(nn.Module):
     def __init__(
@@ -249,15 +245,15 @@ class CSIROModel(nn.Module):
         self.regressor = nn.Linear(fusion_dim // 2, num_classes)
 
     def forward(self, image, metadata=None):
-        image_features = self.image_model(image)  # [B, C_img]
+        image_features = self.image_model(image)
 
         if self.metadata_dim > 0:
-            # -------- meta dropout（训练时部分 batch 整个 meta 清零） --------
+            # Randomly drop metadata during training
             if self.training and metadata is not None and self.meta_dropout_p > 0:
                 if random.random() < self.meta_dropout_p:
                     metadata = torch.zeros_like(metadata)
 
-            # -------- 推理/无 meta 场景：直接用 0 向量 --------
+            # If no metadata is provided, use zero vector
             if metadata is None:
                 meta_features = torch.zeros(
                     image_features.size(0),
@@ -279,11 +275,6 @@ class CSIROModel(nn.Module):
 
 # ==========================================================
 # Train / Valid loop
-# - 训练阶段：三种改进全部融合
-#   1) warmup_epochs: 全部 metadata=None
-#   2) 之后每个 batch 50% 只图像, 50% 图像+meta
-#   3) 模型内部再做 meta_dropout_p
-# - 验证 & 线上：始终 metadata=None
 # ==========================================================
 def train_one_epoch(model, loader, optimizer, criterion, epoch):
     model.train()
@@ -299,11 +290,11 @@ def train_one_epoch(model, loader, optimizer, criterion, epoch):
 
         optimizer.zero_grad()
 
-        # 1) warmup 期：完全不用 meta
+        # Warmup: ignore metadata entirely
         if epoch < CFG.warmup_epochs:
             preds = model(imgs, metadata=None)
 
-        # 2) 正式期：batch 级 50% 只用 image / 50% image+meta
+        # After warmup: randomly choose image-only or image+metadata
         else:
             if random.random() < CFG.image_only_prob:
                 preds = model(imgs, metadata=None)
@@ -340,7 +331,7 @@ def valid_one_epoch(model, loader, criterion):
             imgs = imgs.to(CFG.device)
             targets = targets.to(CFG.device)
 
-            # 验证与线上 test 一致：不传 meta
+            # Validation and test use image-only mode
             preds = model(imgs, metadata=None)
             loss = criterion(preds, targets)
 
@@ -370,34 +361,26 @@ for fold, (train_idx, valid_idx) in enumerate(kf.split(df_all)):
     train_df = df_all.iloc[train_idx].reset_index(drop=True)
     valid_df = df_all.iloc[valid_idx].reset_index(drop=True)
 
-    # -------- 数值 meta 做标准化（每 fold 单独 scaler） --------
-    # 重新构建这一折用的 META_FEATURES 数据
     train_meta = pd.concat(
-        [train_df[num_cols], pd.get_dummies(train_df[["State", "Species"]],
-                                            prefix=["state", "sp"])],
+        [train_df[num_cols], pd.get_dummies(train_df[["State", "Species"]], prefix=["state", "sp"])],
         axis=1
     )
     valid_meta = pd.concat(
-        [valid_df[num_cols], pd.get_dummies(valid_df[["State", "Species"]],
-                                            prefix=["state", "sp"])],
+        [valid_df[num_cols], pd.get_dummies(valid_df[["State", "Species"]], prefix=["state", "sp"])],
         axis=1
     )
 
-    # 对齐 dummy 列
     train_meta, valid_meta = train_meta.align(valid_meta, join="outer", axis=1, fill_value=0.0)
     META_FEATURES = list(train_meta.columns)
 
-    # 标准化数值列（包含日期、高度、NDVI + dummy）
     scaler = StandardScaler()
     train_meta_scaled = scaler.fit_transform(train_meta.values)
     valid_meta_scaled = scaler.transform(valid_meta.values)
 
-    # 把缩放后的 meta 写回 df（这一折专用）
     for i, c in enumerate(META_FEATURES):
         train_df[c] = train_meta_scaled[:, i]
         valid_df[c] = valid_meta_scaled[:, i]
 
-    # 构建 dataset
     train_dataset = BiomassMetaDataset(train_df, CFG.img_root, transform=train_transform)
     valid_dataset = BiomassMetaDataset(valid_df, CFG.img_root, transform=valid_transform)
 
